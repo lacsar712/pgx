@@ -87,6 +87,10 @@ type Conn struct {
 
 	wbuf []byte
 	eqb  ExtendedQueryBuilder
+
+	// policy is the connection-bound query run policy stack. It is allocated per Conn and never
+	// shared between Conns.
+	policy *policyStack
 }
 
 // Identifier a PostgreSQL identifier or name. Identifiers can be composed of
@@ -260,6 +264,7 @@ func connect(ctx context.Context, config *ConnConfig) (c *Conn, err error) {
 		typeMap:     pgtype.NewMap(),
 		queryTracer: config.Tracer,
 	}
+	c.policy = newPolicyStack(c)
 
 	if t, ok := c.queryTracer.(BatchTracer); ok {
 		c.batchTracer = t
@@ -372,6 +377,7 @@ func (c *Conn) Prepare(ctx context.Context, name, sql string) (sd *pgconn.Statem
 
 	if psKey != "" {
 		c.preparedStatements[psKey] = sd
+		c.policy.notePrepare(psKey, psName, sql)
 	}
 
 	return sd, nil
@@ -392,6 +398,8 @@ func (c *Conn) Deallocate(ctx context.Context, name string) error {
 		return err
 	}
 
+	c.policy.noteDeallocate(name, psName)
+
 	if sd != nil {
 		delete(c.preparedStatements, name)
 	}
@@ -402,6 +410,7 @@ func (c *Conn) Deallocate(ctx context.Context, name string) error {
 // DeallocateAll releases all previously prepared statements from the server and client, where it also resets the statement and description cache.
 func (c *Conn) DeallocateAll(ctx context.Context) error {
 	c.preparedStatements = map[string]*pgconn.StatementDescription{}
+	c.policy.noteDeallocateAll()
 	if c.config.StatementCacheCapacity > 0 {
 		c.statementCache = stmtcache.NewLRUCache(c.config.StatementCacheCapacity)
 	}
@@ -480,14 +489,17 @@ func (c *Conn) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.C
 		ctx = c.queryTracer.TraceQueryStart(ctx, c, TraceQueryStartData{SQL: sql, Args: arguments})
 	}
 
-	if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
-		if c.queryTracer != nil {
-			c.queryTracer.TraceQueryEnd(ctx, c, TraceQueryEndData{Err: err})
+	frame := c.policy.top()
+	if frame == nil || frame.axis.StmtCacheGate != StmtCacheGateForbidCache {
+		if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
+			if c.queryTracer != nil {
+				c.queryTracer.TraceQueryEnd(ctx, c, TraceQueryEndData{Err: err})
+			}
+			return pgconn.CommandTag{}, err
 		}
-		return pgconn.CommandTag{}, err
 	}
 
-	commandTag, err := c.exec(ctx, sql, arguments...)
+	commandTag, err := c.exec(ctx, frame, sql, arguments...)
 
 	if c.queryTracer != nil {
 		c.queryTracer.TraceQueryEnd(ctx, c, TraceQueryEndData{CommandTag: commandTag, Err: err})
@@ -496,8 +508,9 @@ func (c *Conn) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.C
 	return commandTag, err
 }
 
-func (c *Conn) exec(ctx context.Context, sql string, arguments ...any) (commandTag pgconn.CommandTag, err error) {
+func (c *Conn) exec(ctx context.Context, frame *policyFrame, sql string, arguments ...any) (commandTag pgconn.CommandTag, err error) {
 	mode := c.config.DefaultQueryExecMode
+	modeExplicit := false
 	var queryRewriter QueryRewriter
 
 optionLoop:
@@ -505,6 +518,7 @@ optionLoop:
 		switch arg := arguments[0].(type) {
 		case QueryExecMode:
 			mode = arg
+			modeExplicit = true
 			arguments = arguments[1:]
 		case QueryRewriter:
 			queryRewriter = arg
@@ -521,13 +535,25 @@ optionLoop:
 		}
 	}
 
-	// Always use simple protocol when there are no arguments.
-	if len(arguments) == 0 {
+	// The query_exec_overlay and stmt_cache_gate axes are read separately; an overlay forces the
+	// mode for the whole frame and never collapses into a cache on/off boolean.
+	overlay := QueryExecOverlayPin
+	gate := StmtCacheGatePin
+	if frame != nil {
+		overlay = frame.axis.QueryExecOverlay
+		gate = frame.axis.StmtCacheGate
+	}
+	mode = c.effectiveQueryExecMode(frame, modeExplicit, mode)
+
+	// Always use simple protocol when there are no arguments, unless the frame forces a prepared
+	// statement path that must remain observable for same-shape no-argument queries.
+	if len(arguments) == 0 && overlay != QueryExecOverlayForceCacheStatement && overlay != QueryExecOverlayForceDescribeExec {
 		mode = QueryExecModeSimpleProtocol
 	}
+	c.policy.noteQuery(mode)
 
 	defer func() {
-		if err != nil {
+		if err != nil && gate != StmtCacheGateForbidCache {
 			if sc := c.statementCache; sc != nil {
 				sc.Invalidate(sql)
 			}
@@ -538,8 +564,12 @@ optionLoop:
 		}
 	}()
 
-	if sd, ok := c.preparedStatements[sql]; ok {
-		return c.execPrepared(ctx, sd, arguments)
+	// force_simple must reach the simple protocol directly; it must not be satisfied by executing
+	// an already prepared statement that happens to have the same text/name.
+	if overlay != QueryExecOverlayForceSimple {
+		if sd, ok := c.preparedStatements[sql]; ok {
+			return c.execPrepared(ctx, sd, arguments)
+		}
 	}
 
 	switch mode {
@@ -762,16 +792,20 @@ func (c *Conn) Query(ctx context.Context, sql string, args ...any) (Rows, error)
 		ctx = c.queryTracer.TraceQueryStart(ctx, c, TraceQueryStartData{SQL: sql, Args: args})
 	}
 
-	if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
-		if c.queryTracer != nil {
-			c.queryTracer.TraceQueryEnd(ctx, c, TraceQueryEndData{Err: err})
+	frame := c.policy.top()
+	if frame == nil || frame.axis.StmtCacheGate != StmtCacheGateForbidCache {
+		if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
+			if c.queryTracer != nil {
+				c.queryTracer.TraceQueryEnd(ctx, c, TraceQueryEndData{Err: err})
+			}
+			return &baseRows{err: err, closed: true}, err
 		}
-		return &baseRows{err: err, closed: true}, err
 	}
 
 	var resultFormats QueryResultFormats
 	var resultFormatsByOID QueryResultFormatsByOID
 	mode := c.config.DefaultQueryExecMode
+	modeExplicit := false
 	var queryRewriter QueryRewriter
 
 optionLoop:
@@ -785,6 +819,7 @@ optionLoop:
 			args = args[1:]
 		case QueryExecMode:
 			mode = arg
+			modeExplicit = true
 			args = args[1:]
 		case QueryRewriter:
 			queryRewriter = arg
@@ -807,16 +842,31 @@ optionLoop:
 		}
 	}
 
+	// Read query_exec_overlay and stmt_cache_gate independently of each other; an overlay forces
+	// the wire path for every Query in the frame, and the cache gate only governs cache usage.
+	overlay := QueryExecOverlayPin
+	if frame != nil {
+		overlay = frame.axis.QueryExecOverlay
+	}
+	mode = c.effectiveQueryExecMode(frame, modeExplicit, mode)
+
 	// Bypass any statement caching.
 	if sql == "" {
 		mode = QueryExecModeSimpleProtocol
 	}
+	c.policy.noteQuery(mode)
 
 	c.eqb.reset()
 	rows := c.getRows(ctx, sql, args)
+	rows.stmtCacheForbidden = frame != nil && frame.axis.StmtCacheGate == StmtCacheGateForbidCache
 
 	var err error
-	sd, explicitPreparedStatement := c.preparedStatements[sql]
+	var sd *pgconn.StatementDescription
+	explicitPreparedStatement := false
+	// force_simple must not be served from a named prepared statement.
+	if overlay != QueryExecOverlayForceSimple {
+		sd, explicitPreparedStatement = c.preparedStatements[sql]
+	}
 	switch {
 	case sd != nil || mode == QueryExecModeCacheStatement || mode == QueryExecModeCacheDescribe || mode == QueryExecModeDescribeExec:
 		if sd == nil {
@@ -927,6 +977,7 @@ func (c *Conn) getStatementDescription(
 				return nil, err
 			}
 			c.descriptionCache.Put(sd)
+			c.policy.noteDescriptionCached(sql)
 		}
 	case QueryExecModeDescribeExec:
 		return c.Prepare(ctx, "", sql)
@@ -949,14 +1000,35 @@ func (c *Conn) QueryRow(ctx context.Context, sql string, args ...any) Row {
 // Depending on the QueryExecMode, all queries may be prepared before any are executed. This means that creating a table
 // and using it in a subsequent query in the same batch can fail.
 func (c *Conn) SendBatch(ctx context.Context, b *Batch) BatchResults {
+	// batch_admit is read on the connection entry point. Tx.SendBatch and pool SendBatch all
+	// delegate here, so frames on this Conn govern every batch path.
+	if frame := c.policy.top(); frame != nil && frame.axis.BatchAdmit == BatchAdmitRejectSend {
+		c.policy.noteBatchRejected()
+		return FailedBatchResults(b, ErrPolicyBatchRejected)
+	}
+
+	c.policy.noteBatchOpen()
 	br := c.sendBatch(ctx, b)
+
+	// Snapshot the frame's cache gate so results closed after the frame is popped still obey it.
+	if frame := c.policy.top(); frame != nil && frame.axis.StmtCacheGate == StmtCacheGateForbidCache {
+		switch r := br.(type) {
+		case *batchResults:
+			r.stmtCacheForbidden = true
+		case *pipelineBatchResults:
+			r.stmtCacheForbidden = true
+		}
+	}
+
 	if b.txOptions == nil {
 		return br
 	}
 
+	tx := &dbTx{conn: c, commitQuery: b.txOptions.CommitQuery}
+	c.policy.noteBeginOpened(tx)
 	return &txBatchResults{
 		BatchResults: br,
-		tx:           &dbTx{conn: c, commitQuery: b.txOptions.CommitQuery},
+		tx:           tx,
 	}
 }
 
@@ -975,8 +1047,11 @@ func (c *Conn) sendBatch(ctx context.Context, b *Batch) (br BatchResults) {
 		}()
 	}
 
-	if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
-		return &batchResults{ctx: ctx, conn: c, err: err}
+	frame := c.policy.top()
+	if frame == nil || frame.axis.StmtCacheGate != StmtCacheGateForbidCache {
+		if err := c.deallocateInvalidatedCachedStatements(ctx); err != nil {
+			return &batchResults{ctx: ctx, conn: c, err: err}
+		}
 	}
 
 	for _, bi := range b.QueuedQueries {
@@ -1008,9 +1083,16 @@ func (c *Conn) sendBatch(ctx context.Context, b *Batch) (br BatchResults) {
 		bi.Arguments = arguments
 	}
 
-	// TODO: changing mode per batch? Update Batch.Queue function comment when implemented
+	// Resolve the batch exec mode from the frame's query_exec_overlay and stmt_cache_gate, then
+	// apply batch_admit=force_pipeline independently of the mode selection.
 	mode := c.config.DefaultQueryExecMode
-	if mode == QueryExecModeSimpleProtocol {
+	forcePipeline := false
+	if frame != nil {
+		mode = c.effectiveQueryExecMode(frame, false, mode)
+		forcePipeline = frame.axis.BatchAdmit == BatchAdmitForcePipeline
+	}
+	if mode == QueryExecModeSimpleProtocol && !forcePipeline {
+		c.policy.noteSimpleBatch()
 		return c.sendBatchQueryExecModeSimpleProtocol(ctx, b)
 	}
 
@@ -1019,6 +1101,16 @@ func (c *Conn) sendBatch(ctx context.Context, b *Batch) (br BatchResults) {
 		if sd, ok := c.preparedStatements[bi.SQL]; ok {
 			bi.sd = sd
 		}
+	}
+
+	if forcePipeline {
+		// The simple-protocol concatenated send and ExecBatch are the non-pipeline paths; pipeline
+		// requires extended protocol, and describe-exec sends every query through its own unnamed
+		// Parse/Bind/Describe/Execute inside one pipeline sync block.
+		if mode == QueryExecModeSimpleProtocol || mode == QueryExecModeExec {
+			mode = QueryExecModeDescribeExec
+		}
+		c.policy.notePipelineBatch()
 	}
 
 	switch mode {
@@ -1245,6 +1337,18 @@ func (c *Conn) sendBatchExtendedWithDescription(ctx context.Context, b *Batch, d
 		}()
 		if err != nil {
 			return &pipelineBatchResults{ctx: ctx, conn: c, err: err, closed: true}
+		}
+	}
+
+	// Record server-side named prepares and description cache entries produced through the batch
+	// pipeline so the active frame can deallocate/remove them on pop.
+	if sdCache != nil {
+		for _, sd := range distinctNewQueries {
+			if sd.Name != "" {
+				c.policy.noteAutoPrepared(sd.Name, sd.SQL)
+			} else {
+				c.policy.noteDescriptionCached(sd.SQL)
+			}
 		}
 	}
 

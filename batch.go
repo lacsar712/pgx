@@ -146,6 +146,9 @@ type batchResults struct {
 	qqIdx     int
 	closed    bool
 	endTraced bool
+
+	// stmtCacheForbidden snapshots the active frame's stmt_cache_gate at send time.
+	stmtCacheForbidden bool
 }
 
 // Exec reads the results from the next query in the batch as if the query has been sent with Exec.
@@ -255,8 +258,14 @@ func (br *batchResults) Close() error {
 			br.endTraced = true
 		}
 
-		invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
+		if br.conn != nil && !br.stmtCacheForbidden {
+			invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
+		}
 	}()
+
+	if !br.closed && br.conn != nil {
+		defer br.conn.policy.noteBatchClosed()
+	}
 
 	if br.err != nil {
 		return br.err
@@ -278,12 +287,12 @@ func (br *batchResults) Close() error {
 		}
 	}
 
-	br.closed = true
-
 	err := br.mrr.Close()
 	if br.err == nil {
 		br.err = err
 	}
+
+	br.closed = true
 
 	return br.err
 }
@@ -308,15 +317,19 @@ func (br *batchResults) nextQueryAndArgs() (query string, args []any, ok bool) {
 }
 
 type pipelineBatchResults struct {
-	ctx       context.Context
-	conn      *Conn
-	pipeline  *pgconn.Pipeline
-	lastRows  *baseRows
-	err       error
-	b         *Batch
-	qqIdx     int
-	closed    bool
-	endTraced bool
+	ctx         context.Context
+	conn        *Conn
+	pipeline    *pgconn.Pipeline
+	lastRows    *baseRows
+	err         error
+	b           *Batch
+	qqIdx       int
+	closed      bool
+	endTraced   bool
+	depthClosed bool
+
+	// stmtCacheForbidden snapshots the active frame's stmt_cache_gate at send time.
+	stmtCacheForbidden bool
 }
 
 // Exec reads the results from the next query in the batch as if the query has been sent with Exec.
@@ -454,6 +467,11 @@ func (br *pipelineBatchResults) QueryRow() Row {
 // Close closes the batch operation. Any error that occurred during a batch operation may have made it impossible to
 // resyncronize the connection with the server. In this case the underlying connection will have been closed.
 func (br *pipelineBatchResults) Close() error {
+	if br.conn != nil && !br.depthClosed {
+		br.depthClosed = true
+		defer br.conn.policy.noteBatchClosed()
+	}
+
 	defer func() {
 		if !br.endTraced {
 			if br.conn.batchTracer != nil {
@@ -462,9 +480,10 @@ func (br *pipelineBatchResults) Close() error {
 			br.endTraced = true
 		}
 
-		invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
+		if !br.stmtCacheForbidden {
+			invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
+		}
 	}()
-
 	if br.err == nil && br.lastRows != nil && br.lastRows.err != nil {
 		br.err = br.lastRows.err
 	}
@@ -552,6 +571,9 @@ func (br *emptyBatchResults) QueryRow() Row {
 // Close closes the batch operation. Any error that occurred during a batch operation may have made it impossible to
 // resyncronize the connection with the server. In this case the underlying connection will have been closed.
 func (br *emptyBatchResults) Close() error {
+	if !br.closed && br.conn != nil {
+		br.conn.policy.noteBatchClosed()
+	}
 	br.closed = true
 	return nil
 }

@@ -125,6 +125,12 @@ func (c *Conn) Begin(ctx context.Context) (Tx, error) {
 // BeginTx starts a transaction with txOptions determining the transaction mode. Unlike [database/sql], the context only
 // affects the begin command. i.e. there is no auto-rollback on context cancellation.
 func (c *Conn) BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error) {
+	// tx_admit is read on the connection entry point; pool Begin/BeginTx delegate here.
+	if frame := c.policy.top(); frame != nil && frame.axis.TxAdmit == TxAdmitRejectBegin {
+		c.policy.noteBeginRejected()
+		return nil, ErrPolicyBeginRejected
+	}
+
 	_, err := c.Exec(ctx, txOptions.beginSQL())
 	if err != nil {
 		// begin kills the connection upon receiving fatal, panic or non PGError errors,
@@ -136,10 +142,12 @@ func (c *Conn) BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error) {
 		return nil, err
 	}
 
-	return &dbTx{
+	tx := &dbTx{
 		conn:        c,
 		commitQuery: txOptions.CommitQuery,
-	}, nil
+	}
+	c.policy.noteBeginOpened(tx)
+	return tx, nil
 }
 
 func isConnectionFatal(pgErr *pgconn.PgError) bool {
@@ -203,6 +211,12 @@ type dbTx struct {
 func (tx *dbTx) Begin(ctx context.Context) (Tx, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
+	}
+
+	// Nested begins read the same tx_admit axis as Conn.Begin/BeginTx.
+	if frame := tx.conn.policy.top(); frame != nil && frame.axis.TxAdmit == TxAdmitRejectBegin {
+		tx.conn.policy.noteBeginRejected()
+		return nil, ErrPolicyBeginRejected
 	}
 
 	tx.savepointNum++

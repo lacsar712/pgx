@@ -263,13 +263,23 @@ func (ct *copyFrom) buildCopyBuf(buf []byte, sd *pgconn.StatementDescription) (b
 // Even though enum types appear to be strings they still must be registered to use with [Conn.CopyFrom]. This can be done with
 // [Conn.LoadType] and [pgtype.Map.RegisterType].
 func (c *Conn) CopyFrom(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (int64, error) {
+	// CopyFrom reads the same stack as the other exits: the query_exec_overlay chooses the
+	// description/mode path and stmt_cache_gate applies. CopyFrom itself never starts a
+	// transaction, so a tx_admit=reject_begin frame cannot cause a hidden transactional COPY
+	// session; the wire traffic stays a single COPY ... FROM STDIN.
+	mode := c.config.DefaultQueryExecMode
+	if frame := c.policy.top(); frame != nil {
+		mode = c.effectiveQueryExecMode(frame, false, mode)
+		c.policy.noteCopyFrom()
+	}
+
 	ct := &copyFrom{
 		conn:          c,
 		tableName:     tableName,
 		columnNames:   columnNames,
 		rowSrc:        rowSrc,
 		readerErrChan: make(chan error),
-		mode:          c.config.DefaultQueryExecMode,
+		mode:          mode,
 	}
 
 	return ct.run(ctx)

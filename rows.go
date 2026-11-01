@@ -157,6 +157,10 @@ type baseRows struct {
 	conn              *Conn
 	multiResultReader *pgconn.MultiResultReader
 
+	// stmtCacheForbidden snapshots the active frame's stmt_cache_gate at send time so Rows closed
+	// after the frame is popped still obey it.
+	stmtCacheForbidden bool
+
 	queryTracer QueryTracer
 	batchTracer BatchTracer
 	ctx         context.Context
@@ -192,7 +196,7 @@ func (rows *baseRows) Close() {
 		}
 	}
 
-	if rows.err != nil && rows.conn != nil && rows.sql != "" {
+	if rows.err != nil && rows.conn != nil && rows.sql != "" && !rows.stmtCacheForbidden {
 		if sc := rows.conn.statementCache; sc != nil {
 			sc.Invalidate(rows.sql)
 		}
